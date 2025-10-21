@@ -544,18 +544,16 @@ async def process_comfyui_connect(session, photo_base64, client_id, status_messa
         "client_id": client_id
     }
     
-    # Добавляем параметры если указаны
+    # Логируем параметры (пока не отправляем на сервер)
+    # TODO: Настроить workflow в ComfyUI для приёма параметров через $duration и $quality ноды
     if duration is not None:
-        payload["duration"] = {
-            "seconds": duration
-        }
-        logger.info(f"📏 Длительность: {duration} секунд")
+        logger.info(f"📏 Параметр: Длительность {duration} секунд")
+        # payload["duration"] = {"seconds": duration}  # Будет позже
     
     if quality is not None:
-        payload["quality"] = {
-            "pixels": QUALITIES[quality]['pixels']
-        }
-        logger.info(f"📺 Качество: {QUALITIES[quality]['pixels']}px")
+        quality_pixels = QUALITIES[quality]['pixels']
+        logger.info(f"📺 Параметр: Качество {quality_pixels}px")
+        # payload["quality"] = {"pixels": quality_pixels}  # Будет позже
     
     logger.info(f"🚀 Отправляю запрос на ComfyUI-Connect: {API_URL}")
     logger.debug(f"Payload keys: {payload.keys()}")
