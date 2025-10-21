@@ -42,6 +42,8 @@ Thumbs.db
 
 # Bot data
 processing_stats.json
+balances.db
+balances.db-journal
 
 # Logs
 *.log

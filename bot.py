@@ -4,6 +4,7 @@ import base64
 import asyncio
 import time
 import aiohttp
+import sqlite3
 from io import BytesIO
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
@@ -28,11 +29,100 @@ if DEBUG_MODE:
 
 # Конфигурация
 BOT_TOKEN = os.getenv('BOT_TOKEN')
+ADMIN_USER_ID = int(os.getenv('ADMIN_USER_ID', '0'))
 # ComfyUI-Connect endpoint для workflow 'api-video'
 API_URL = 'https://cuda.serge.cc/api/connect/workflows/api-video'
 
+# Настройки токенов
+TOKENS_PER_VIDEO = int(os.getenv('TOKENS_PER_VIDEO', '10'))
+DEFAULT_TOKENS = int(os.getenv('DEFAULT_TOKENS', '100'))
+
 # Статистика обработки
 processing_times = []
+
+# Система балансов
+class TokenBalance:
+    def __init__(self, db_path='balances.db'):
+        self.db_path = db_path
+        self.init_db()
+    
+    def init_db(self):
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS balances (
+                user_id INTEGER PRIMARY KEY,
+                tokens INTEGER NOT NULL DEFAULT 0,
+                username TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        conn.commit()
+        conn.close()
+        logger.info("💾 База данных балансов инициализирована")
+    
+    def get_balance(self, user_id):
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute('SELECT tokens FROM balances WHERE user_id = ?', (user_id,))
+        result = cursor.fetchone()
+        conn.close()
+        
+        if result:
+            return result[0]
+        else:
+            self.add_tokens(user_id, DEFAULT_TOKENS)
+            return DEFAULT_TOKENS
+    
+    def add_tokens(self, user_id, amount, username=None):
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+            INSERT INTO balances (user_id, tokens, username) 
+            VALUES (?, ?, ?)
+            ON CONFLICT(user_id) 
+            DO UPDATE SET tokens = tokens + ?, username = COALESCE(?, username), updated_at = CURRENT_TIMESTAMP
+        ''', (user_id, amount, username, amount, username))
+        
+        conn.commit()
+        
+        cursor.execute('SELECT tokens FROM balances WHERE user_id = ?', (user_id,))
+        new_balance = cursor.fetchone()[0]
+        conn.close()
+        
+        logger.info(f"💰 +{amount} токенов для {user_id} ({username}), баланс: {new_balance}")
+        return new_balance
+    
+    def spend_tokens(self, user_id, amount):
+        balance = self.get_balance(user_id)
+        
+        if balance < amount:
+            return False
+        
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute('''
+            UPDATE balances 
+            SET tokens = tokens - ?, updated_at = CURRENT_TIMESTAMP 
+            WHERE user_id = ?
+        ''', (amount, user_id))
+        conn.commit()
+        conn.close()
+        
+        logger.info(f"💸 -{amount} токенов для {user_id}, осталось: {balance - amount}")
+        return True
+    
+    def get_all_users(self):
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute('SELECT user_id, tokens, username FROM balances ORDER BY tokens DESC')
+        users = cursor.fetchall()
+        conn.close()
+        return users
+
+token_balance = TokenBalance()
 
 def format_time(seconds):
     """Форматирование времени в читаемый вид"""
@@ -84,17 +174,37 @@ async def safe_edit_message(message, text, max_retries=3):
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Команда /start"""
+    user_id = update.effective_user.id
+    username = update.effective_user.username or update.effective_user.first_name
+    balance = token_balance.get_balance(user_id)
+    
     avg_time = get_average_time()
     stats_text = ""
     if processing_times:
-        stats_text = f"\n\n📊 Среднее время: {format_time(avg_time)}"
+        stats_text = f"\n📊 Среднее время: {format_time(avg_time)}"
     
     await update.message.reply_text(
-        '👋 Привет! Я создаю видео из фотографий.\n\n'
-        '📸 Просто отправьте любое изображение,\n'
-        'и я преобразую его в видео!\n'
-        f'{stats_text}\n\n'
-        '💡 Команда /stats покажет статистику'
+        f'👋 Привет, {username}!\n\n'
+        f'📸 Отправьте фото - я создам видео!{stats_text}\n\n'
+        f'💰 Баланс: {balance} токенов\n'
+        f'💵 Стоимость: {TOKENS_PER_VIDEO} токенов/видео\n\n'
+        f'📋 /balance - баланс\n'
+        f'📊 /stats - статистика'
+    )
+
+async def balance_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда /balance"""
+    user_id = update.effective_user.id
+    username = update.effective_user.username or update.effective_user.first_name
+    balance = token_balance.get_balance(user_id)
+    videos_available = balance // TOKENS_PER_VIDEO
+    
+    await update.message.reply_text(
+        f'💰 Ваш баланс\n\n'
+        f'👤 {username}\n'
+        f'🪙 Токенов: {balance}\n'
+        f'🎬 Видео доступно: {videos_available}\n\n'
+        f'💵 Стоимость: {TOKENS_PER_VIDEO} токенов/видео'
     )
 
 async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -120,6 +230,58 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     
     await update.message.reply_text(stats_text)
+
+async def addtokens_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда /addtokens - добавление токенов (только админ)"""
+    user_id = update.effective_user.id
+    
+    if user_id != ADMIN_USER_ID:
+        await update.message.reply_text('❌ Нет прав')
+        return
+    
+    if len(context.args) < 2:
+        await update.message.reply_text(
+            '📝 /addtokens USER_ID AMOUNT\n'
+            'Пример: /addtokens 123456 100'
+        )
+        return
+    
+    try:
+        target_id = int(context.args[0])
+        amount = int(context.args[1])
+        new_balance = token_balance.add_tokens(target_id, amount)
+        await update.message.reply_text(
+            f'✅ Добавлено: {amount}\n'
+            f'👤 ID: {target_id}\n'
+            f'💰 Баланс: {new_balance}'
+        )
+    except ValueError:
+        await update.message.reply_text('❌ Неверный формат')
+    except Exception as e:
+        await update.message.reply_text(f'❌ Ошибка: {e}')
+
+async def users_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда /users - список пользователей (только админ)"""
+    user_id = update.effective_user.id
+    
+    if user_id != ADMIN_USER_ID:
+        await update.message.reply_text('❌ Нет прав')
+        return
+    
+    users = token_balance.get_all_users()
+    
+    if not users:
+        await update.message.reply_text('📋 Нет пользователей')
+        return
+    
+    text = '📋 Пользователи:\n\n'
+    for uid, tokens, uname in users[:20]:
+        text += f'👤 {uname or "?"} ({uid})\n   💰 {tokens}\n\n'
+    
+    if len(users) > 20:
+        text += f'...еще {len(users) - 20}'
+    
+    await update.message.reply_text(text)
 
 async def update_progress(message, start_time, phase="Обработка"):
     """Обновление прогресс-сообщения"""
@@ -465,9 +627,22 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработка фотографии от пользователя"""
     start_time = time.time()
     user_id = update.effective_user.id
+    username = update.effective_user.username or update.effective_user.first_name
+    
+    # Проверяем баланс
+    balance = token_balance.get_balance(user_id)
+    
+    if balance < TOKENS_PER_VIDEO:
+        await update.message.reply_text(
+            f'❌ Недостаточно токенов!\n\n'
+            f'💰 Баланс: {balance}\n'
+            f'💵 Требуется: {TOKENS_PER_VIDEO}\n\n'
+            f'Обратитесь к @{(await update.get_bot()).username} администратору'
+        )
+        return
     
     client_id = f"telegram_{user_id}_{int(start_time * 1000)}"
-    logger.info(f"📸 Новый запрос от пользователя {user_id}")
+    logger.info(f"📸 Запрос от {user_id} ({username}), баланс: {balance}")
     
     # Начальное сообщение
     status_message = await update.message.reply_text("🔄 Получаю изображение...")
@@ -540,13 +715,22 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     f"📤 Отправляю видео..."
                 )
                 
+                # Списываем токены
+                token_balance.spend_tokens(user_id, TOKENS_PER_VIDEO)
+                new_balance = token_balance.get_balance(user_id)
+                
                 # Отправляем видео пользователю
                 video_buffer = BytesIO(video_data)
                 video_buffer.name = 'video.mp4'
                 
                 await update.message.reply_video(
                     video=video_buffer,
-                    caption=f"🎬 Ваше видео готово!\n⏱ Обработано за {format_time(total_time)}"
+                    caption=(
+                        f"🎬 Видео готово!\n"
+                        f"⏱ {format_time(total_time)}\n\n"
+                        f"💸 Списано: {TOKENS_PER_VIDEO} токенов\n"
+                        f"💰 Остаток: {new_balance}"
+                    )
                 )
                 
                 # Удаляем статус-сообщение
@@ -587,7 +771,10 @@ def main():
     
     # Регистрируем обработчики
     application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("balance", balance_command))
     application.add_handler(CommandHandler("stats", stats_command))
+    application.add_handler(CommandHandler("addtokens", addtokens_command))
+    application.add_handler(CommandHandler("users", users_command))
     application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     
