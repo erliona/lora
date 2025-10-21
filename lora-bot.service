@@ -1,0 +1,17 @@
+[Unit]
+Description=Lora Telegram Bot
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/lora_bot
+Environment=PATH=/root/lora_bot/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStart=/root/lora_bot/.venv/bin/python /root/lora_bot/bot.py
+Restart=always
+RestartSec=10
+StandardOutput=append:/root/lora_bot/bot.log
+StandardError=append:/root/lora_bot/bot.log
+
+[Install]
+WantedBy=multi-user.target

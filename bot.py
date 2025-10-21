@@ -159,7 +159,7 @@ async def update_progress(message, start_time, phase="Обработка"):
     
     await safe_edit_message(message, text)
 
-async def process_comfyui_connect(session, photo_base64, status_message, start_time):
+async def process_comfyui_connect(session, photo_base64, client_id, status_message, start_time):
     """
     Отправка запроса в ComfyUI-Connect и получение результата
     
@@ -177,9 +177,10 @@ async def process_comfyui_connect(session, photo_base64, status_message, start_t
             "image": {
                 "type": "file",
                 "content": photo_base64,
-                "name": f"input_{int(time.time())}.jpg"
+                "name": f"input_{client_id}.jpg"
             }
-        }
+        },
+        "client_id": client_id
     }
     
     logger.info(f"🚀 Отправляю запрос на ComfyUI-Connect: {API_URL}")
@@ -328,7 +329,30 @@ async def process_comfyui_connect(session, photo_base64, status_message, start_t
                             if subkey in value:
                                 subvalue = value[subkey]
                                 logger.info(f"    🔍 Проверяю подключ '{subkey}' типа {type(subvalue).__name__}")
-                                if isinstance(subvalue, str) and len(subvalue) > 100:
+                                
+                                # Если это список - проверяем первый элемент
+                                if isinstance(subvalue, list) and len(subvalue) > 0:
+                                    first_item = subvalue[0]
+                                    logger.info(f"      📋 Список из {len(subvalue)} элементов")
+                                    if isinstance(first_item, str) and len(first_item) > 100:
+                                        decoded = base64.b64decode(first_item)
+                                        logger.info(f"      ✓ Декодировано {len(decoded)} байт из списка, hex: {decoded[:20].hex()}")
+                                        
+                                        if len(decoded) > 10000:
+                                            if is_media_data(decoded):
+                                                video_data = decoded
+                                                found_key = f"{key}.{subkey}[0]"
+                                                logger.info(f"✅ Найдено видео в '{key}.{subkey}[0]' по magic bytes, размер: {len(decoded)} байт")
+                                                break
+                                            else:
+                                                logger.warning(f"⚠️ Неизвестные magic bytes в '{key}.{subkey}[0]', но файл большой ({len(decoded)} байт)")
+                                                video_data = decoded
+                                                found_key = f"{key}.{subkey}[0]"
+                                                logger.info(f"✅ Используем данные из '{key}.{subkey}[0]', размер: {len(decoded)} байт")
+                                                break
+                                
+                                # Если это строка - проверяем напрямую
+                                elif isinstance(subvalue, str) and len(subvalue) > 100:
                                     decoded = base64.b64decode(subvalue)
                                     logger.info(f"    ✓ Декодировано {len(decoded)} байт")
                                     
@@ -354,7 +378,80 @@ async def process_comfyui_connect(session, photo_base64, status_message, start_t
                 return video_data, None
             else:
                 logger.error(f"❌ Не найдено видео в ответе. Ключи: {list(result.keys())}")
-                return None, "Сервер не вернул видео"
+                # Fallback: пробуем через History API (для VHS_VideoCombine)
+                logger.info("🔍 Output пустой, пробую через History API...")
+                
+                # Имя файла который мы отправили (для поиска правильной задачи)
+                search_filename = f"input_{client_id}.jpg"
+                logger.info(f"🔎 Ищу задачу с файлом: {search_filename}")
+                
+                # Ждем чтобы задача точно появилась в history
+                await asyncio.sleep(5)
+                
+                for attempt in range(20):  # 20 попыток по 3 секунды
+                    try:
+                        history_url = "https://cuda.serge.cc/history"
+                        async with session.get(history_url) as hist_response:
+                            if hist_response.status != 200:
+                                await asyncio.sleep(3)
+                                continue
+                            
+                            history = await hist_response.json()
+                            logger.debug(f"History: {len(history)} записей")
+                            
+                            # Ищем нашу задачу по имени файла в workflow
+                            for prompt_id, prompt_data in history.items():
+                                if not isinstance(prompt_data, dict):
+                                    continue
+                                
+                                # Проверяем workflow (prompt[2])
+                                prompt = prompt_data.get('prompt', [])
+                                if isinstance(prompt, list) and len(prompt) > 2:
+                                    workflow = prompt[2]
+                                    
+                                    # Ищем search_filename в workflow
+                                    import json as json_lib
+                                    workflow_str = json_lib.dumps(workflow)
+                                    
+                                    if search_filename in workflow_str:
+                                        logger.info(f"✅ Найдена наша задача: {prompt_id}")
+                                        
+                                        # Проверяем outputs
+                                        outputs = prompt_data.get('outputs', {})
+                                        if not outputs:
+                                            logger.debug(f"Outputs пока пусты для {prompt_id}, жду...")
+                                            continue
+                                        
+                                        for node_id, node_output in outputs.items():
+                                            if not isinstance(node_output, dict):
+                                                continue
+                                            
+                                            for output_key in ['gifs', 'videos']:
+                                                videos = node_output.get(output_key, [])
+                                                if videos and isinstance(videos, list):
+                                                    for video_info in videos:
+                                                        if isinstance(video_info, dict):
+                                                            filename = video_info.get('filename', '')
+                                                            if filename.endswith(('.mp4', '.webm', '.avi', '.mov', '.gif')):
+                                                                subfolder = video_info.get('subfolder', '')
+                                                                folder_type = video_info.get('type', 'output')
+                                                                logger.info(f"✅ Найдено видео: {filename}")
+                                                                
+                                                                download_url = "https://cuda.serge.cc/view"
+                                                                params = {"filename": filename, "type": folder_type, "subfolder": subfolder}
+                                                                
+                                                                async with session.get(download_url, params=params) as dl_response:
+                                                                    if dl_response.status == 200:
+                                                                        video_bytes = await dl_response.read()
+                                                                        logger.info(f"✅ Скачано {len(video_bytes)} байт")
+                                                                        return video_bytes, None
+                        
+                    except Exception as e:
+                        logger.error(f"History error: {e}")
+                    
+                    await asyncio.sleep(3)
+                
+                return None, "Видео не найдено в history"
     
     except asyncio.TimeoutError:
         logger.error(f"⏱ Таймаут запроса после 10 минут")
@@ -369,6 +466,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     start_time = time.time()
     user_id = update.effective_user.id
     
+    client_id = f"telegram_{user_id}_{int(start_time * 1000)}"
     logger.info(f"📸 Новый запрос от пользователя {user_id}")
     
     # Начальное сообщение
@@ -406,7 +504,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 
                 # Отправляем запрос в ComfyUI-Connect (это может занять несколько минут)
                 video_data, error = await process_comfyui_connect(
-                    session, photo_base64, status_message, start_time
+                    session, photo_base64, client_id, status_message, start_time
                 )
                 
                 # Останавливаем обновление прогресса
