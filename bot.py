@@ -18,9 +18,11 @@ load_dotenv()
 
 # Настройка логирования
 logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', 
+    level=logging.INFO
 )
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG)
 
 # Конфигурация
 BOT_TOKEN = os.getenv('BOT_TOKEN')
@@ -471,57 +473,53 @@ async def poll_for_completion(session, client_id, tracker, stop_event=None, poll
                     continue
                 
                 history = await response.json()
+                logger.debug(f"{client_id}: получено {len(history)} записей в history")
                 
                 # Ищем задачу по client_id
                 for prompt_id, prompt_data in history.items():
-                    if not isinstance(prompt_data, dict) or 'prompt' not in prompt_data:
+                    if not isinstance(prompt_data, dict):
                         continue
                     
-                    prompt_info = prompt_data['prompt']
+                    # Проверяем client_id в корне prompt_data
+                    stored_client_id = prompt_data.get('client_id')
                     
-                    # Проверяем что prompt_info это словарь
-                    if not isinstance(prompt_info, dict):
-                        continue
-                    
-                    # Проверяем client_id в prompt
-                    found_client_id = None
-                    for node_id, node_data in prompt_info.items():
-                        if isinstance(node_data, dict):
-                            inputs = node_data.get('inputs', {})
-                            if inputs.get('client_id') == client_id:
-                                found_client_id = client_id
-                                break
-                    
-                    if not found_client_id:
-                        continue
-                    
-                    # Нашли нашу задачу! Проверяем outputs
-                    outputs = prompt_data.get('outputs', {})
-                    for node_id, node_output in outputs.items():
-                        if not isinstance(node_output, dict):
+                    if stored_client_id == client_id:
+                        logger.info(f"{client_id}: найден prompt_id {prompt_id}")
+                        
+                        # Проверяем outputs
+                        outputs = prompt_data.get('outputs', {})
+                        if not outputs:
+                            logger.debug(f"{client_id}: outputs пусты для {prompt_id}")
                             continue
                         
-                        videos = node_output.get('gifs', []) or node_output.get('videos', [])
-                        
-                        for video_info in videos:
-                            if isinstance(video_info, dict):
-                                filename = video_info.get('filename', '')
+                        for node_id, node_output in outputs.items():
+                            if not isinstance(node_output, dict):
+                                continue
+                            
+                            # Проверяем разные типы выходных данных
+                            for output_key in ['videos', 'gifs', 'images']:
+                                videos = node_output.get(output_key, [])
                                 
-                                # Проверяем что это видео-файл
-                                if any(filename.endswith(ext) for ext in ['.mp4', '.avi', '.mov', '.gif']):
-                                    subfolder = video_info.get('subfolder', '')
-                                    folder_type = video_info.get('type', 'output')
-                                    
-                                    logger.info(f"{client_id}: найден результат {filename}")
-                                    tracker.set_completed()
-                                    
-                                    return (filename, subfolder, folder_type)
+                                if videos and isinstance(videos, list):
+                                    for video_info in videos:
+                                        if isinstance(video_info, dict):
+                                            filename = video_info.get('filename', '')
+                                            
+                                            # Проверяем что это видео-файл
+                                            if any(filename.endswith(ext) for ext in ['.mp4', '.avi', '.mov', '.gif', '.webm']):
+                                                subfolder = video_info.get('subfolder', '')
+                                                folder_type = video_info.get('type', 'output')
+                                                
+                                                logger.info(f"{client_id}: найден результат {filename} (тип: {output_key})")
+                                                tracker.set_completed()
+                                                
+                                                return (filename, subfolder, folder_type)
         
         except asyncio.CancelledError:
             logger.info(f"{client_id}: опрос отменен")
             raise
         except Exception as e:
-            logger.error(f"{client_id}: ошибка опроса: {e}")
+            logger.error(f"{client_id}: ошибка опроса: {e}", exc_info=True)
             await asyncio.sleep(poll_interval)
     
     return None
@@ -671,6 +669,8 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             async with session.post(API_URL, json=payload) as response:
                 if response.status != 200:
                     elapsed = time.time() - start_time
+                    response_text = await response.text()
+                    logger.error(f"{client_id}: ошибка сервера {response.status}: {response_text[:200]}")
                     await safe_edit_message(
                         status_message,
                         f"❌ Ошибка сервера: HTTP {response.status}\n"
@@ -680,7 +680,10 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     return
                 
                 result = await response.json()
-                logger.info(f"{client_id}: получен ответ {result.get('status')}")
+                logger.info(f"{client_id}: получен ответ {result}")
+                prompt_id = result.get('prompt_id')
+                if prompt_id:
+                    logger.info(f"{client_id}: назначен prompt_id = {prompt_id}")
             
             # Запускаем фоновые задачи
             tracker.switch_phase("В очереди на обработку")
@@ -697,9 +700,9 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 poll_for_completion(session, client_id, tracker, stop_event)
             )
             
-            # Ждем готовности (до 5 минут)
+            # Ждем готовности (до 10 минут)
             try:
-                result = await asyncio.wait_for(poll_task, timeout=300)
+                result = await asyncio.wait_for(poll_task, timeout=600)
                 
                 if result:
                     filename, subfolder, folder_type = result
