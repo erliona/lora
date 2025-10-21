@@ -2,7 +2,6 @@ import os
 import logging
 import base64
 import asyncio
-import uuid
 import time
 import json
 import websockets
@@ -379,7 +378,6 @@ async def update_progress_message(status_message, client_id, start_time):
             queue_info = f" (в очереди: {tracker.queue_position})"
         elif tracker.is_executing:
             queue_info = " (выполняется)"
-            queue_info = " (выполняется)"
         
         new_message = (
             f'{frame} {current_phase}{queue_info}...\n'
@@ -415,7 +413,8 @@ async def websocket_monitor_task(client_id, tracker, stop_event=None):
     НЕ используется для определения завершения задачи.
     """
     try:
-        async with websockets.connect(WS_URL.format(client_id)) as websocket:
+        ws_url = f"{WS_URL}?clientId={client_id}"
+        async with websockets.connect(ws_url) as websocket:
             logger.info(f"WebSocket подключен для {client_id}")
             await websocket.recv()  # Читаем начальное сообщение
             
@@ -525,52 +524,6 @@ async def poll_for_completion(session, client_id, tracker, stop_event=None, poll
             logger.error(f"{client_id}: ошибка опроса: {e}")
             await asyncio.sleep(poll_interval)
     
-    return None
-
-async def wait_for_result_by_client_id(session, client_id, max_attempts=60):
-    logger.info(f"Ждем результат для client_id: {client_id}")
-    
-    for attempt in range(max_attempts):
-        try:
-            history_url = "https://cuda.serge.cc/history"
-            async with session.get(history_url) as response:
-                if response.status == 200:
-                    history = await response.json()
-                    
-                    for prompt_id, prompt_data in history.items():
-                        if isinstance(prompt_data, dict) and 'prompt' in prompt_data:
-                            prompt_info = prompt_data['prompt']
-                            
-                            if isinstance(prompt_info, list) and len(prompt_info) >= 3:
-                                prompt_dict = prompt_info[2]
-                                prompt_str = str(prompt_dict)
-                                
-                                if client_id in prompt_str:
-                                    logger.info(f"Найден prompt {prompt_id} для client_id {client_id}")
-                                    
-                                    if 'outputs' in prompt_data and prompt_data['outputs']:
-                                        outputs = prompt_data['outputs']
-                                        
-                                        for node_id, node_output in outputs.items():
-                                            if isinstance(node_output, dict):
-                                                for key in ['videos', 'gifs', 'images']:
-                                                    if key in node_output and node_output[key]:
-                                                        media_data = node_output[key]
-                                                        if isinstance(media_data, list) and len(media_data) > 0:
-                                                            media_item = media_data[0]
-                                                            if isinstance(media_item, dict) and 'filename' in media_item:
-                                                                filename = media_item['filename']
-                                                                if filename.endswith(('.mp4', '.avi', '.mov', '.gif')):
-                                                                    logger.info(f"Найдено видео для {client_id}: {filename}")
-                                                                    return media_item
-            
-            await asyncio.sleep(2)
-            
-        except Exception as e:
-            logger.error(f"Ошибка при ожидании результата для {client_id}: {e}")
-            await asyncio.sleep(3)
-    
-    logger.warning(f"Таймаут для {client_id}")
     return None
 
 async def download_video_file(session, filename, subfolder="", folder_type="output"):
