@@ -38,7 +38,61 @@ TOKENS_PER_VIDEO = int(os.getenv('TOKENS_PER_VIDEO', '10'))
 DEFAULT_TOKENS = int(os.getenv('DEFAULT_TOKENS', '100'))
 
 # Статистика обработки
-processing_times = []
+class ProcessingStats:
+    def __init__(self, stats_file='processing_stats.json'):
+        self.stats_file = stats_file
+        self.times = []
+        self.load()
+    
+    def load(self):
+        """Загрузить статистику из файла"""
+        try:
+            if os.path.exists(self.stats_file):
+                with open(self.stats_file, 'r') as f:
+                    import json
+                    data = json.load(f)
+                    
+                    # Поддержка старого формата от bot_old.py
+                    if 'completion_times' in data:
+                        self.times = data['completion_times']
+                        logger.info(f"📊 Загружено {len(self.times)} записей (старый формат)")
+                    else:
+                        self.times = data.get('times', [])
+                        logger.info(f"📊 Загружено {len(self.times)} записей статистики")
+        except Exception as e:
+            logger.error(f"Ошибка загрузки статистики: {e}")
+            self.times = []
+    
+    def save(self):
+        """Сохранить статистику в файл"""
+        try:
+            import json
+            with open(self.stats_file, 'w') as f:
+                json.dump({'times': self.times}, f)
+        except Exception as e:
+            logger.error(f"Ошибка сохранения статистики: {e}")
+    
+    def add_time(self, duration):
+        """Добавить время обработки"""
+        self.times.append(duration)
+        # Храним последние 100 записей
+        if len(self.times) > 100:
+            self.times = self.times[-100:]
+        self.save()
+        logger.info(f"📊 Время обработки: {format_time(duration)}, всего записей: {len(self.times)}")
+    
+    def get_times(self):
+        """Получить все времена"""
+        return self.times
+    
+    def get_average(self):
+        """Среднее время последних 10 записей"""
+        if not self.times:
+            return 120
+        recent = self.times[-10:]
+        return sum(recent) / len(recent)
+
+processing_stats = ProcessingStats()
 
 # Система балансов
 class TokenBalance:
@@ -49,6 +103,8 @@ class TokenBalance:
     def init_db(self):
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
+        
+        # Создаем таблицу если не существует
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS balances (
                 user_id INTEGER PRIMARY KEY,
@@ -61,9 +117,27 @@ class TokenBalance:
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         ''')
+        
+        # Миграция: добавляем новые поля если их нет
+        cursor.execute("PRAGMA table_info(balances)")
+        columns = [column[1] for column in cursor.fetchall()]
+        
+        if 'first_name' not in columns:
+            logger.info("📝 Миграция: добавляем поле first_name")
+            cursor.execute('ALTER TABLE balances ADD COLUMN first_name TEXT')
+        
+        if 'last_name' not in columns:
+            logger.info("📝 Миграция: добавляем поле last_name")
+            cursor.execute('ALTER TABLE balances ADD COLUMN last_name TEXT')
+        
+        if 'videos_created' not in columns:
+            logger.info("📝 Миграция: добавляем поле videos_created")
+            cursor.execute('ALTER TABLE balances ADD COLUMN videos_created INTEGER DEFAULT 0')
+            cursor.execute('UPDATE balances SET videos_created = 0 WHERE videos_created IS NULL')
+        
         conn.commit()
         conn.close()
-        logger.info("💾 База данных балансов инициализирована")
+        logger.info("💾 База данных балансов готова")
     
     def get_balance(self, user_id):
         conn = sqlite3.connect(self.db_path)
@@ -164,10 +238,7 @@ def format_time(seconds):
 
 def get_average_time():
     """Получить среднее время обработки (последние 10 запросов)"""
-    if not processing_times:
-        return 120  # По умолчанию 2 минуты
-    recent = processing_times[-10:]
-    return sum(recent) / len(recent)
+    return processing_stats.get_average()
 
 def get_progress_bar(progress):
     """Создать прогресс-бар"""
@@ -210,8 +281,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     token_balance.add_tokens(user_id, 0, username, first_name, last_name)
     
     avg_time = get_average_time()
+    times = processing_stats.get_times()
     stats_text = ""
-    if processing_times:
+    if times:
         stats_text = f"\n📊 Среднее время: {format_time(avg_time)}"
     
     await update.message.reply_text(
@@ -240,20 +312,22 @@ async def balance_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Команда /stats - показывает статистику обработки"""
-    if not processing_times:
+    times = processing_stats.get_times()
+    
+    if not times:
         await update.message.reply_text(
             '📊 Статистика пока пуста.\n'
             'Отправьте фото для начала!'
         )
         return
     
-    avg = sum(processing_times) / len(processing_times)
+    avg = sum(times) / len(times)
     recent_avg = get_average_time()
-    min_time = min(processing_times)
-    max_time = max(processing_times)
+    min_time = min(times)
+    max_time = max(times)
     
     stats_text = (
-        f"📊 Статистика обработки ({len(processing_times)} видео):\n\n"
+        f"📊 Статистика обработки ({len(times)} видео):\n\n"
         f"⚡ Быстрее всего: {format_time(min_time)}\n"
         f"📈 В среднем: {format_time(avg)}\n"
         f"🐌 Дольше всего: {format_time(max_time)}\n"
@@ -764,11 +838,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 
                 # Успех! Отправляем видео
                 total_time = time.time() - start_time
-                processing_times.append(total_time)
-                
-                # Сохраняем последние 50 результатов
-                if len(processing_times) > 50:
-                    processing_times.pop(0)
+                processing_stats.add_time(total_time)
                 
                 await safe_edit_message(
                     status_message,
