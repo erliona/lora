@@ -54,6 +54,9 @@ class TokenBalance:
                 user_id INTEGER PRIMARY KEY,
                 tokens INTEGER NOT NULL DEFAULT 0,
                 username TEXT,
+                first_name TEXT,
+                last_name TEXT,
+                videos_created INTEGER DEFAULT 0,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
@@ -75,16 +78,21 @@ class TokenBalance:
             self.add_tokens(user_id, DEFAULT_TOKENS)
             return DEFAULT_TOKENS
     
-    def add_tokens(self, user_id, amount, username=None):
+    def add_tokens(self, user_id, amount, username=None, first_name=None, last_name=None):
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         
         cursor.execute('''
-            INSERT INTO balances (user_id, tokens, username) 
-            VALUES (?, ?, ?)
+            INSERT INTO balances (user_id, tokens, username, first_name, last_name) 
+            VALUES (?, ?, ?, ?, ?)
             ON CONFLICT(user_id) 
-            DO UPDATE SET tokens = tokens + ?, username = COALESCE(?, username), updated_at = CURRENT_TIMESTAMP
-        ''', (user_id, amount, username, amount, username))
+            DO UPDATE SET 
+                tokens = tokens + ?, 
+                username = COALESCE(?, username),
+                first_name = COALESCE(?, first_name),
+                last_name = COALESCE(?, last_name),
+                updated_at = CURRENT_TIMESTAMP
+        ''', (user_id, amount, username, first_name, last_name, amount, username, first_name, last_name))
         
         conn.commit()
         
@@ -94,6 +102,18 @@ class TokenBalance:
         
         logger.info(f"💰 +{amount} токенов для {user_id} ({username}), баланс: {new_balance}")
         return new_balance
+    
+    def increment_videos(self, user_id):
+        """Увеличить счетчик созданных видео"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute('''
+            UPDATE balances 
+            SET videos_created = videos_created + 1 
+            WHERE user_id = ?
+        ''', (user_id,))
+        conn.commit()
+        conn.close()
     
     def spend_tokens(self, user_id, amount):
         balance = self.get_balance(user_id)
@@ -117,7 +137,12 @@ class TokenBalance:
     def get_all_users(self):
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
-        cursor.execute('SELECT user_id, tokens, username FROM balances ORDER BY tokens DESC')
+        cursor.execute('''
+            SELECT user_id, tokens, username, first_name, last_name, videos_created, 
+                   created_at, updated_at 
+            FROM balances 
+            ORDER BY tokens DESC
+        ''')
         users = cursor.fetchall()
         conn.close()
         return users
@@ -175,8 +200,14 @@ async def safe_edit_message(message, text, max_retries=3):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Команда /start"""
     user_id = update.effective_user.id
-    username = update.effective_user.username or update.effective_user.first_name
+    user = update.effective_user
+    username = user.username
+    first_name = user.first_name
+    last_name = user.last_name
+    
+    # Обновляем информацию о пользователе
     balance = token_balance.get_balance(user_id)
+    token_balance.add_tokens(user_id, 0, username, first_name, last_name)
     
     avg_time = get_average_time()
     stats_text = ""
@@ -275,11 +306,39 @@ async def users_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     text = '📋 Пользователи:\n\n'
-    for uid, tokens, uname in users[:20]:
-        text += f'👤 {uname or "?"} ({uid})\n   💰 {tokens}\n\n'
+    for user_data in users[:15]:
+        uid, tokens, uname, fname, lname, videos, created, updated = user_data
+        
+        # Формируем имя
+        full_name = ' '.join(filter(None, [fname, lname]))
+        display_name = full_name or uname or 'Без имени'
+        
+        # Форматируем дату создания
+        from datetime import datetime
+        try:
+            created_dt = datetime.fromisoformat(created)
+            created_str = created_dt.strftime('%d.%m.%Y')
+        except:
+            created_str = 'н/д'
+        
+        text += (
+            f'👤 {display_name}\n'
+            f'   ID: {uid}\n'
+        )
+        
+        if uname:
+            text += f'   @{uname}\n'
+        
+        text += (
+            f'   💰 Токенов: {tokens}\n'
+            f'   🎬 Видео: {videos}\n'
+            f'   📅 С {created_str}\n\n'
+        )
     
-    if len(users) > 20:
-        text += f'...еще {len(users) - 20}'
+    if len(users) > 15:
+        text += f'...и еще {len(users) - 15} пользователей'
+    
+    text += f'\n\n📊 Всего пользователей: {len(users)}'
     
     await update.message.reply_text(text)
 
@@ -627,10 +686,11 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработка фотографии от пользователя"""
     start_time = time.time()
     user_id = update.effective_user.id
-    username = update.effective_user.username or update.effective_user.first_name
+    user = update.effective_user
     
-    # Проверяем баланс
+    # Обновляем информацию о пользователе и проверяем баланс
     balance = token_balance.get_balance(user_id)
+    token_balance.add_tokens(user_id, 0, user.username, user.first_name, user.last_name)
     
     if balance < TOKENS_PER_VIDEO:
         await update.message.reply_text(
@@ -642,7 +702,8 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     client_id = f"telegram_{user_id}_{int(start_time * 1000)}"
-    logger.info(f"📸 Запрос от {user_id} ({username}), баланс: {balance}")
+    display_name = user.first_name or user.username or str(user_id)
+    logger.info(f"📸 Запрос от {user_id} ({display_name}), баланс: {balance}")
     
     # Начальное сообщение
     status_message = await update.message.reply_text("🔄 Получаю изображение...")
@@ -715,8 +776,9 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     f"📤 Отправляю видео..."
                 )
                 
-                # Списываем токены
+                # Списываем токены и увеличиваем счетчик видео
                 token_balance.spend_tokens(user_id, TOKENS_PER_VIDEO)
+                token_balance.increment_videos(user_id)
                 new_balance = token_balance.get_balance(user_id)
                 
                 # Отправляем видео пользователю
