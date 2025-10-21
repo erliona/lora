@@ -14,11 +14,17 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # Настройка логирования
+DEBUG_MODE = os.getenv('DEBUG', 'false').lower() == 'true'
+log_level = logging.DEBUG if DEBUG_MODE else logging.INFO
+
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', 
-    level=logging.INFO
+    level=log_level
 )
 logger = logging.getLogger(__name__)
+
+if DEBUG_MODE:
+    logger.info("🐛 DEBUG режим включен")
 
 # Конфигурация
 BOT_TOKEN = os.getenv('BOT_TOKEN')
@@ -194,7 +200,32 @@ async def process_comfyui_connect(session, photo_base64, status_message, start_t
             # ComfyUI-Connect возвращает JSON с результатами
             result = await response.json()
             logger.info(f"✅ Получен ответ от сервера")
-            logger.debug(f"Response keys: {result.keys()}")
+            
+            # Выводим полный JSON для отладки
+            import json as json_lib
+            result_str = json_lib.dumps(result, indent=2, ensure_ascii=False)
+            # Обрезаем очень длинные base64 строки для читаемости логов
+            if len(result_str) > 2000:
+                logger.info(f"Full response (truncated): {result_str[:2000]}...")
+            else:
+                logger.info(f"Full response: {result_str}")
+            
+            logger.info(f"Response keys: {list(result.keys())}")
+            
+            # Выводим детали по каждому ключу
+            for key, value in result.items():
+                if isinstance(value, str):
+                    logger.info(f"  {key}: string длина={len(value)} начало={value[:100]}")
+                elif isinstance(value, list):
+                    logger.info(f"  {key}: list элементов={len(value)}")
+                    if len(value) > 0:
+                        logger.info(f"    первый элемент: {type(value[0]).__name__}")
+                        if isinstance(value[0], str) and len(value[0]) > 50:
+                            logger.info(f"    начало: {value[0][:100]}")
+                elif isinstance(value, dict):
+                    logger.info(f"  {key}: dict ключей={len(value.keys())}, keys={list(value.keys())}")
+                else:
+                    logger.info(f"  {key}: {type(value).__name__} = {value}")
             
             # Ищем видео в ответе
             # В зависимости от аннотаций в workflow, результат может быть под разными ключами
@@ -203,9 +234,33 @@ async def process_comfyui_connect(session, photo_base64, status_message, start_t
             video_data = None
             found_key = None
             
+            # Функция для проверки является ли данные видео/изображением
+            def is_media_data(data):
+                """Проверяет магические байты медиа-файлов"""
+                if len(data) < 10:
+                    return False
+                # MP4, MOV, M4V
+                if data[:4] in [b'\x00\x00\x00\x18', b'\x00\x00\x00\x1c', b'\x00\x00\x00 ', 
+                               b'\x00\x00\x00\x14', b'ftyp']:
+                    return True
+                # GIF
+                if data[:3] == b'GIF':
+                    return True
+                # JPEG
+                if data[:2] == b'\xff\xd8':
+                    return True
+                # PNG
+                if data[:4] == b'\x89PNG':
+                    return True
+                # WebM
+                if data[:4] == b'\x1aE\xdf\xa3':
+                    return True
+                return False
+            
             # Проверяем различные возможные ключи
             for key in result.keys():
                 value = result[key]
+                logger.debug(f"Проверяю ключ '{key}' типа {type(value).__name__}")
                 
                 # Если это строка (base64), пытаемся декодировать
                 if isinstance(value, str) and len(value) > 100:
@@ -213,31 +268,49 @@ async def process_comfyui_connect(session, photo_base64, status_message, start_t
                         # Проверяем что это валидный base64
                         decoded = base64.b64decode(value)
                         
-                        # Проверяем что это видео/изображение (начинается с магических байтов)
-                        if decoded[:4] in [b'\x00\x00\x00\x18', b'\x00\x00\x00\x1c', b'\x00\x00\x00 '] or \
-                           decoded[:3] == b'GIF' or decoded[:2] == b'\xff\xd8':
+                        # Проверяем что это медиа-файл
+                        if is_media_data(decoded):
                             video_data = decoded
                             found_key = key
                             logger.info(f"✅ Найдено видео в ключе '{key}', размер: {len(decoded)} байт")
                             break
                     except Exception as e:
-                        logger.debug(f"Ключ '{key}' не содержит валидный base64: {e}")
+                        logger.debug(f"Ключ '{key}' не base64: {e}")
                         continue
                 
                 # Если это список base64 строк (несколько выходов)
                 elif isinstance(value, list) and len(value) > 0:
                     try:
                         first_item = value[0]
-                        if isinstance(first_item, str):
+                        if isinstance(first_item, str) and len(first_item) > 100:
                             decoded = base64.b64decode(first_item)
-                            if decoded[:4] in [b'\x00\x00\x00\x18', b'\x00\x00\x00\x1c', b'\x00\x00\x00 '] or \
-                               decoded[:3] == b'GIF' or decoded[:2] == b'\xff\xd8':
+                            if is_media_data(decoded):
                                 video_data = decoded
                                 found_key = f"{key}[0]"
                                 logger.info(f"✅ Найдено видео в массиве '{key}', размер: {len(decoded)} байт")
                                 break
                     except Exception as e:
-                        logger.debug(f"Массив '{key}' не содержит валидный base64: {e}")
+                        logger.debug(f"Массив '{key}' не содержит base64: {e}")
+                        continue
+                
+                # Если это словарь (вложенная структура)
+                elif isinstance(value, dict):
+                    try:
+                        # Ищем внутри словаря ключи типа 'data', 'content', 'file'
+                        for subkey in ['data', 'content', 'file', 'video', 'image', 'output']:
+                            if subkey in value:
+                                subvalue = value[subkey]
+                                if isinstance(subvalue, str) and len(subvalue) > 100:
+                                    decoded = base64.b64decode(subvalue)
+                                    if is_media_data(decoded):
+                                        video_data = decoded
+                                        found_key = f"{key}.{subkey}"
+                                        logger.info(f"✅ Найдено видео в '{key}.{subkey}', размер: {len(decoded)} байт")
+                                        break
+                        if video_data:
+                            break
+                    except Exception as e:
+                        logger.debug(f"Dict '{key}' не содержит медиа: {e}")
                         continue
             
             if video_data:
