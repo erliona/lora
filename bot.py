@@ -257,56 +257,93 @@ async def process_comfyui_connect(session, photo_base64, status_message, start_t
                     return True
                 return False
             
-            # Проверяем различные возможные ключи
-            for key in result.keys():
+            # Приоритетно проверяем ключ 'output' (из аннотации #output)
+            priority_keys = ['output', 'result', 'video', 'image']
+            all_keys = priority_keys + [k for k in result.keys() if k not in priority_keys]
+            
+            for key in all_keys:
+                if key not in result:
+                    continue
+                    
                 value = result[key]
-                logger.debug(f"Проверяю ключ '{key}' типа {type(value).__name__}")
+                logger.info(f"🔍 Проверяю ключ '{key}' типа {type(value).__name__}")
                 
                 # Если это строка (base64), пытаемся декодировать
                 if isinstance(value, str) and len(value) > 100:
                     try:
                         # Проверяем что это валидный base64
                         decoded = base64.b64decode(value)
+                        logger.info(f"  ✓ Декодировано {len(decoded)} байт, первые байты: {decoded[:20].hex()}")
                         
-                        # Проверяем что это медиа-файл
-                        if is_media_data(decoded):
-                            video_data = decoded
-                            found_key = key
-                            logger.info(f"✅ Найдено видео в ключе '{key}', размер: {len(decoded)} байт")
-                            break
+                        # Если данные достаточно большие (больше 10KB), скорее всего это медиа
+                        if len(decoded) > 10000:
+                            # Проверяем магические байты
+                            if is_media_data(decoded):
+                                video_data = decoded
+                                found_key = key
+                                logger.info(f"✅ Найдено видео в ключе '{key}' по magic bytes, размер: {len(decoded)} байт")
+                                break
+                            else:
+                                # Большой файл но неизвестный формат - все равно пробуем
+                                logger.warning(f"⚠️ Неизвестные magic bytes, но файл большой ({len(decoded)} байт), пробую использовать")
+                                video_data = decoded
+                                found_key = key
+                                logger.info(f"✅ Используем данные из '{key}', размер: {len(decoded)} байт")
+                                break
                     except Exception as e:
                         logger.debug(f"Ключ '{key}' не base64: {e}")
                         continue
                 
                 # Если это список base64 строк (несколько выходов)
                 elif isinstance(value, list) and len(value) > 0:
+                    logger.info(f"  📋 Список из {len(value)} элементов")
                     try:
                         first_item = value[0]
                         if isinstance(first_item, str) and len(first_item) > 100:
                             decoded = base64.b64decode(first_item)
-                            if is_media_data(decoded):
-                                video_data = decoded
-                                found_key = f"{key}[0]"
-                                logger.info(f"✅ Найдено видео в массиве '{key}', размер: {len(decoded)} байт")
-                                break
+                            logger.info(f"  ✓ Декодировано {len(decoded)} байт из массива, первые байты: {decoded[:20].hex()}")
+                            
+                            if len(decoded) > 10000:
+                                if is_media_data(decoded):
+                                    video_data = decoded
+                                    found_key = f"{key}[0]"
+                                    logger.info(f"✅ Найдено видео в массиве '{key}' по magic bytes, размер: {len(decoded)} байт")
+                                    break
+                                else:
+                                    logger.warning(f"⚠️ Неизвестные magic bytes в массиве, но файл большой ({len(decoded)} байт)")
+                                    video_data = decoded
+                                    found_key = f"{key}[0]"
+                                    logger.info(f"✅ Используем данные из массива '{key}', размер: {len(decoded)} байт")
+                                    break
                     except Exception as e:
                         logger.debug(f"Массив '{key}' не содержит base64: {e}")
                         continue
                 
                 # Если это словарь (вложенная структура)
                 elif isinstance(value, dict):
+                    logger.info(f"  📦 Словарь с ключами: {list(value.keys())}")
                     try:
                         # Ищем внутри словаря ключи типа 'data', 'content', 'file'
                         for subkey in ['data', 'content', 'file', 'video', 'image', 'output']:
                             if subkey in value:
                                 subvalue = value[subkey]
+                                logger.info(f"    🔍 Проверяю подключ '{subkey}' типа {type(subvalue).__name__}")
                                 if isinstance(subvalue, str) and len(subvalue) > 100:
                                     decoded = base64.b64decode(subvalue)
-                                    if is_media_data(decoded):
-                                        video_data = decoded
-                                        found_key = f"{key}.{subkey}"
-                                        logger.info(f"✅ Найдено видео в '{key}.{subkey}', размер: {len(decoded)} байт")
-                                        break
+                                    logger.info(f"    ✓ Декодировано {len(decoded)} байт")
+                                    
+                                    if len(decoded) > 10000:
+                                        if is_media_data(decoded):
+                                            video_data = decoded
+                                            found_key = f"{key}.{subkey}"
+                                            logger.info(f"✅ Найдено видео в '{key}.{subkey}' по magic bytes, размер: {len(decoded)} байт")
+                                            break
+                                        else:
+                                            logger.warning(f"⚠️ Неизвестные magic bytes в '{key}.{subkey}', но файл большой")
+                                            video_data = decoded
+                                            found_key = f"{key}.{subkey}"
+                                            logger.info(f"✅ Используем данные из '{key}.{subkey}', размер: {len(decoded)} байт")
+                                            break
                         if video_data:
                             break
                     except Exception as e:
