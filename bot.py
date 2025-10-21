@@ -6,8 +6,11 @@ import time
 import aiohttp
 import sqlite3
 from io import BytesIO
-from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    Application, CommandHandler, MessageHandler, CallbackQueryHandler,
+    ConversationHandler, filters, ContextTypes
+)
 from telegram.error import BadRequest, RetryAfter
 from dotenv import load_dotenv
 
@@ -36,6 +39,57 @@ API_URL = 'https://cuda.serge.cc/api/connect/workflows/api-video'
 # Настройки токенов
 TOKENS_PER_VIDEO = int(os.getenv('TOKENS_PER_VIDEO', '10'))
 DEFAULT_TOKENS = int(os.getenv('DEFAULT_TOKENS', '100'))
+
+# Конфигурация параметров создания видео
+DURATIONS = {
+    '5': {
+        'seconds': 5,
+        'cost': 5,
+        'name': '⚡ 5 секунд',
+        'description': 'Короткое видео для Stories',
+        'emoji': '⚡',
+    },
+    '10': {
+        'seconds': 10,
+        'cost': 10,
+        'name': '⭐ 10 секунд',
+        'description': 'Оптимальная длительность',
+        'emoji': '⭐',
+        'recommended': True,
+    },
+    '15': {
+        'seconds': 15,
+        'cost': 15,
+        'name': '🎬 15 секунд',
+        'description': 'Полное видео',
+        'emoji': '🎬',
+    }
+}
+
+QUALITIES = {
+    'low': {
+        'name': '📱 Низкое',
+        'pixels': 300,
+        'cost_modifier': 0,
+        'description': 'Быстрая загрузка',
+        'emoji': '📱',
+    },
+    'medium': {
+        'name': '💎 Среднее',
+        'pixels': 600,
+        'cost_modifier': 0,
+        'description': 'Баланс качества и размера',
+        'emoji': '💎',
+        'recommended': True,
+    },
+    'high': {
+        'name': '🎯 Высокое',
+        'pixels': 832,
+        'cost_modifier': 5,
+        'description': 'Максимальное качество',
+        'emoji': '🎯',
+    }
+}
 
 # Статистика обработки
 class ProcessingStats:
@@ -223,6 +277,19 @@ class TokenBalance:
 
 token_balance = TokenBalance()
 
+# States для ConversationHandler
+WAITING_PHOTO, CHOOSING_DURATION, CHOOSING_QUALITY, CONFIRMATION = range(4)
+
+def calculate_cost(duration, quality):
+    """Рассчитать итоговую стоимость"""
+    base_cost = DURATIONS[str(duration)]['cost']
+    quality_mod = QUALITIES[quality]['cost_modifier']
+    return base_cost + quality_mod
+
+def format_size_kb(bytes):
+    """Форматировать размер в KB"""
+    return f"{bytes // 1024} KB"
+
 def format_time(seconds):
     """Форматирование времени в читаемый вид"""
     if seconds < 60:
@@ -288,11 +355,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     await update.message.reply_text(
         f'👋 Привет, {username}!\n\n'
-        f'📸 Отправьте фото - я создам видео!{stats_text}\n\n'
+        f'Я создаю видео из фотографий!{stats_text}\n\n'
+        f'🎬 Два способа создания:\n'
+        f'• /create - мастер с выбором параметров\n'
+        f'• Просто отправьте фото - быстрый режим\n\n'
         f'💰 Баланс: {balance} токенов\n'
-        f'💵 Стоимость: {TOKENS_PER_VIDEO} токенов/видео\n\n'
-        f'📋 /balance - баланс\n'
-        f'📊 /stats - статистика'
+        f'💵 Стоимость: от 5 токенов\n\n'
+        f'📋 /balance - баланс | /stats - статистика'
     )
 
 async def balance_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -454,19 +523,16 @@ async def update_progress(message, start_time, phase="Обработка"):
     
     await safe_edit_message(message, text)
 
-async def process_comfyui_connect(session, photo_base64, client_id, status_message, start_time):
+async def process_comfyui_connect(session, photo_base64, client_id, status_message, start_time,
+                                  duration=None, quality=None):
     """
     Отправка запроса в ComfyUI-Connect и получение результата
     
-    ComfyUI-Connect возвращает результат сразу в ответе в виде:
-    {
-        "output_name": "base64_encoded_data..."
-    }
+    Args:
+        duration: Длительность в секундах (5/10/15) или None для стандарт
+        quality: Качество 'low'/'medium'/'high' или None для стандарт
     """
-    # Формируем payload согласно документации ComfyUI-Connect
-    # Для загрузки изображения используем формат:
-    # "node-name": { "image": { "type": "file", "content": "base64", "name": "filename" } }
-    
+    # Формируем payload
     payload = {
         "image": {
             "image": {
@@ -477,6 +543,19 @@ async def process_comfyui_connect(session, photo_base64, client_id, status_messa
         },
         "client_id": client_id
     }
+    
+    # Добавляем параметры если указаны
+    if duration is not None:
+        payload["duration"] = {
+            "seconds": duration
+        }
+        logger.info(f"📏 Длительность: {duration} секунд")
+    
+    if quality is not None:
+        payload["quality"] = {
+            "pixels": QUALITIES[quality]['pixels']
+        }
+        logger.info(f"📺 Качество: {QUALITIES[quality]['pixels']}px")
     
     logger.info(f"🚀 Отправляю запрос на ComfyUI-Connect: {API_URL}")
     logger.debug(f"Payload keys: {payload.keys()}")
@@ -756,6 +835,451 @@ async def process_comfyui_connect(session, photo_base64, client_id, status_messa
         logger.error(f"❌ Ошибка запроса: {e}", exc_info=True)
         return None, f"Ошибка: {str(e)[:100]}"
 
+# ============================================
+# ИНТЕРАКТИВНЫЙ МАСТЕР СОЗДАНИЯ ВИДЕО
+# ============================================
+
+async def create_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда /create - запуск мастера создания видео"""
+    user_id = update.effective_user.id
+    username = update.effective_user.username or update.effective_user.first_name
+    balance = token_balance.get_balance(user_id)
+    
+    if balance < 5:
+        await update.message.reply_text(
+            "❌ Недостаточно токенов!\n\n"
+            f"💰 Ваш баланс: {balance}\n"
+            "💵 Минимум для создания: 5 токенов\n\n"
+            "Обратитесь к администратору"
+        )
+        return ConversationHandler.END
+    
+    context.user_data['create_session'] = {
+        'started_at': time.time(),
+        'step': 1,
+        'user_id': user_id,
+        'username': username
+    }
+    
+    keyboard = [[InlineKeyboardButton("❌ Отмена", callback_data='cancel')]]
+    
+    await update.message.reply_text(
+        "🎬 Мастер создания видео\n\n"
+        "Я помогу создать видео из вашей фотографии!\n\n"
+        "📸 Шаг 1 из 3: Загрузка фото\n\n"
+        "Отправьте любую фотографию.\n"
+        "Лучше всего работает с:\n\n"
+        "✅ Портретами людей\n"
+        "✅ Чёткими изображениями\n"
+        "✅ Хорошим освещением\n\n"
+        f"💰 Ваш баланс: {balance} токенов",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+    
+    return WAITING_PHOTO
+
+async def photo_received_wizard(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Получено фото в мастере"""
+    if 'create_session' not in context.user_data:
+        await update.message.reply_text("Сначала запустите /create")
+        return ConversationHandler.END
+    
+    photo = update.message.photo[-1]
+    file = await context.bot.get_file(photo.file_id)
+    
+    photo_data = BytesIO()
+    await file.download_to_memory(photo_data)
+    photo_data.seek(0)
+    photo_base64 = base64.b64encode(photo_data.read()).decode()
+    
+    session = context.user_data['create_session']
+    session.update({
+        'photo_base64': photo_base64,
+        'photo_size': file.file_size,
+        'photo_width': photo.width,
+        'photo_height': photo.height,
+        'step': 2
+    })
+    
+    keyboard = []
+    for dur_key in ['5', '10', '15']:
+        dur = DURATIONS[dur_key]
+        text = f"{dur['emoji']} {dur['seconds']} сек - {dur['cost']}💰"
+        if dur.get('recommended'):
+            text += " ⭐"
+        keyboard.append([InlineKeyboardButton(text, callback_data=f'duration_{dur_key}')])
+    
+    keyboard.append([
+        InlineKeyboardButton("⏮ Другое фото", callback_data='back_photo'),
+        InlineKeyboardButton("❌ Отмена", callback_data='cancel')
+    ])
+    
+    await update.message.reply_text(
+        f"✅ Фото получено!\n\n"
+        f"📏 {photo.width}×{photo.height} px\n"
+        f"📦 {format_size_kb(file.file_size)}\n\n"
+        f"⏱ Шаг 2 из 3: Длительность\n\n"
+        f"Выберите длительность видео:",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+    
+    return CHOOSING_DURATION
+
+async def duration_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Выбрана длительность"""
+    query = update.callback_query
+    await query.answer()
+    
+    duration = query.data.split('_')[1]
+    session = context.user_data['create_session']
+    session.update({
+        'duration': int(duration),
+        'step': 3
+    })
+    
+    keyboard = []
+    for qual_key in ['low', 'medium', 'high']:
+        qual = QUALITIES[qual_key]
+        cost_mod = qual['cost_modifier']
+        current_cost = DURATIONS[duration]['cost'] + cost_mod
+        
+        text = f"{qual['emoji']} {qual['name']} ({qual['pixels']}px)"
+        if cost_mod > 0:
+            text += f" - +{cost_mod}💰"
+        else:
+            text += " - бесплатно"
+        
+        if qual.get('recommended'):
+            text += " ⭐"
+        
+        text += f"\nИтого: {current_cost}💰"
+        
+        keyboard.append([InlineKeyboardButton(text, callback_data=f'quality_{qual_key}')])
+    
+    keyboard.append([
+        InlineKeyboardButton("⏮ Назад", callback_data='back_duration'),
+        InlineKeyboardButton("❌ Отмена", callback_data='cancel')
+    ])
+    
+    await query.edit_message_text(
+        f"✅ Длительность: {duration} секунд\n\n"
+        f"📺 Шаг 3 из 3: Качество\n\n"
+        f"Выберите качество видео:",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+    
+    return CHOOSING_QUALITY
+
+async def quality_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Выбрано качество - показываем подтверждение"""
+    query = update.callback_query
+    await query.answer()
+    
+    quality = query.data.split('_')[1]
+    session = context.user_data['create_session']
+    session.update({
+        'quality': quality,
+        'step': 4
+    })
+    
+    duration = session['duration']
+    cost = calculate_cost(duration, quality)
+    balance = token_balance.get_balance(session['user_id'])
+    
+    if balance < cost:
+        await query.answer("❌ Недостаточно токенов!", show_alert=True)
+        await query.edit_message_text(
+            f"❌ Недостаточно токенов!\n\n"
+            f"💰 Ваш баланс: {balance}\n"
+            f"💵 Требуется: {cost}\n\n"
+            f"Выберите другие параметры или обратитесь к администратору"
+        )
+        return ConversationHandler.END
+    
+    duration_info = DURATIONS[str(duration)]
+    quality_info = QUALITIES[quality]
+    
+    text = f"""📋 Подтверждение создания
+
+╔════════════════════════════╗
+║  ПАРАМЕТРЫ ВИДЕО           ║
+╠════════════════════════════╣
+║ 📸 Фото: {session['photo_width']}×{session['photo_height']} px    ║
+║ ⏱ Длительность: {duration} секунд   ║
+║ 📺 Качество: {quality_info['pixels']}px         ║
+╠════════════════════════════╣
+║ 💰 СТОИМОСТЬ               ║
+╠════════════════════════════╣
+║ Базовая: {duration_info['cost']} токенов         ║
+║ Качество: +{quality_info['cost_modifier']} токенов        ║
+║ ─────────────────────      ║
+║ Итого: {cost} токенов           ║
+╠════════════════════════════╣
+║ 💳 Баланс: {balance}             ║
+║ 💵 Останется: {balance - cost}        ║
+╚════════════════════════════╝
+
+⏱ Примерное время: ~2 минуты
+
+Всё правильно?
+"""
+    
+    keyboard = [
+        [InlineKeyboardButton("✅ СОЗДАТЬ ВИДЕО", callback_data='confirm_create')],
+        [],
+        [
+            InlineKeyboardButton("⏱ Время", callback_data='edit_duration'),
+            InlineKeyboardButton("📺 Качество", callback_data='edit_quality')
+        ],
+        [InlineKeyboardButton("❌ Отмена", callback_data='cancel')]
+    ]
+    
+    await query.edit_message_text(
+        text,
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+    
+    return CONFIRMATION
+
+async def confirm_create_wizard(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Подтверждено - начинаем обработку"""
+    query = update.callback_query
+    await query.answer("🚀 Начинаю создание!")
+    
+    session = context.user_data['create_session']
+    user_id = session['user_id']
+    
+    await query.edit_message_text(
+        f"🚀 Создаю видео!\n\n"
+        f"⏱ Длительность: {session['duration']} секунд\n"
+        f"📺 Качество: {QUALITIES[session['quality']]['pixels']}px\n\n"
+        f"Ожидайте..."
+    )
+    
+    # Запускаем обработку с параметрами
+    start_time = time.time()
+    client_id = f"telegram_{user_id}_{int(start_time * 1000)}"
+    
+    status_message = query.message
+    
+    try:
+        async with aiohttp.ClientSession() as http_session:
+            progress_task = None
+            
+            async def progress_updater():
+                await asyncio.sleep(2)
+                while True:
+                    await update_progress(status_message, start_time, "Создаю видео")
+                    await asyncio.sleep(2)
+            
+            try:
+                progress_task = asyncio.create_task(progress_updater())
+                
+                # Передаём параметры в process_comfyui_connect
+                video_data, error = await process_comfyui_connect(
+                    http_session, session['photo_base64'], client_id,
+                    status_message, start_time,
+                    duration=session['duration'],
+                    quality=session['quality']
+                )
+                
+                if progress_task:
+                    progress_task.cancel()
+                    try:
+                        await progress_task
+                    except asyncio.CancelledError:
+                        pass
+                
+                if error or not video_data:
+                    elapsed = time.time() - start_time
+                    await safe_edit_message(
+                        status_message,
+                        f"❌ {error or 'Не удалось получить видео'}\n"
+                        f"⏱ Время: {format_time(elapsed)}"
+                    )
+                else:
+                    total_time = time.time() - start_time
+                    processing_stats.add_time(total_time)
+                    
+                    token_balance.spend_tokens(user_id, calculate_cost(session['duration'], session['quality']))
+                    token_balance.increment_videos(user_id)
+                    new_balance = token_balance.get_balance(user_id)
+                    
+                    await safe_edit_message(
+                        status_message,
+                        f"✅ Готово за {format_time(total_time)}!\n"
+                        f"📤 Отправляю видео..."
+                    )
+                    
+                    video_buffer = BytesIO(video_data)
+                    video_buffer.name = 'video.mp4'
+                    
+                    await update.effective_chat.send_video(
+                        video=video_buffer,
+                        caption=(
+                            f"🎬 Видео готово!\n"
+                            f"⏱ {format_time(total_time)}\n\n"
+                            f"💸 Списано: {calculate_cost(session['duration'], session['quality'])} токенов\n"
+                            f"💰 Остаток: {new_balance}"
+                        )
+                    )
+                    
+                    await status_message.delete()
+                    
+            except asyncio.CancelledError:
+                if progress_task:
+                    progress_task.cancel()
+                raise
+                
+    except Exception as e:
+        logger.error(f"Ошибка в мастере: {e}", exc_info=True)
+        await safe_edit_message(
+            status_message,
+            f"❌ Произошла ошибка\n{str(e)[:100]}"
+        )
+    finally:
+        context.user_data.pop('create_session', None)
+    
+    return ConversationHandler.END
+
+async def back_to_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Возврат к загрузке фото"""
+    query = update.callback_query
+    await query.answer()
+    
+    session = context.user_data.get('create_session', {})
+    session['step'] = 1
+    
+    keyboard = [[InlineKeyboardButton("❌ Отмена", callback_data='cancel')]]
+    
+    await query.edit_message_text(
+        "📸 Шаг 1 из 3: Фото\n\n"
+        "Отправьте новую фотографию",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+    
+    return WAITING_PHOTO
+
+async def back_to_duration(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Возврат к выбору длительности"""
+    query = update.callback_query
+    await query.answer()
+    
+    session = context.user_data['create_session']
+    session['step'] = 2
+    current_duration = str(session.get('duration', '10'))
+    
+    keyboard = []
+    for dur_key in ['5', '10', '15']:
+        dur = DURATIONS[dur_key]
+        text = f"{dur['emoji']} {dur['seconds']} сек - {dur['cost']}💰"
+        if dur_key == current_duration:
+            text += " ✅"
+        elif dur.get('recommended'):
+            text += " ⭐"
+        keyboard.append([InlineKeyboardButton(text, callback_data=f'duration_{dur_key}')])
+    
+    keyboard.append([
+        InlineKeyboardButton("⏮ К фото", callback_data='back_photo'),
+        InlineKeyboardButton("❌ Отмена", callback_data='cancel')
+    ])
+    
+    await query.edit_message_text(
+        "⏱ Шаг 2 из 3: Длительность\n\n"
+        "Выберите длительность видео:",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+    
+    return CHOOSING_DURATION
+
+async def edit_duration_from_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Редактирование длительности с экрана подтверждения"""
+    return await back_to_duration(update, context)
+
+async def edit_quality_from_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Редактирование качества с экрана подтверждения"""
+    query = update.callback_query
+    await query.answer()
+    
+    session = context.user_data['create_session']
+    duration = str(session['duration'])
+    current_quality = session.get('quality', 'medium')
+    
+    keyboard = []
+    for qual_key in ['low', 'medium', 'high']:
+        qual = QUALITIES[qual_key]
+        cost_mod = qual['cost_modifier']
+        current_cost = DURATIONS[duration]['cost'] + cost_mod
+        
+        text = f"{qual['emoji']} {qual['name']} ({qual['pixels']}px)"
+        if cost_mod > 0:
+            text += f" +{cost_mod}💰"
+        
+        if qual_key == current_quality:
+            text += " ✅"
+        elif qual.get('recommended'):
+            text += " ⭐"
+        
+        text += f"\nИтого: {current_cost}💰"
+        
+        keyboard.append([InlineKeyboardButton(text, callback_data=f'quality_{qual_key}')])
+    
+    keyboard.append([
+        InlineKeyboardButton("⏮ Назад", callback_data='back_quality'),
+        InlineKeyboardButton("❌ Отмена", callback_data='cancel')
+    ])
+    
+    await query.edit_message_text(
+        "📺 Шаг 3 из 3: Качество\n\n"
+        "Выберите качество видео:",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+    
+    return CHOOSING_QUALITY
+
+async def back_to_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Возврат к подтверждению (после редактирования)"""
+    return await quality_selected(update, context)
+
+async def cancel_wizard(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Отмена мастера"""
+    query = update.callback_query
+    await query.answer("❌ Отменено")
+    
+    context.user_data.pop('create_session', None)
+    
+    await query.edit_message_text(
+        "❌ Создание видео отменено.\n\n"
+        "Для нового запроса используйте /create"
+    )
+    
+    return ConversationHandler.END
+
+async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда /cancel"""
+    context.user_data.pop('create_session', None)
+    
+    await update.message.reply_text(
+        "❌ Текущая операция отменена.\n\n"
+        "Для создания видео используйте /create"
+    )
+    
+    return ConversationHandler.END
+
+async def conversation_timeout(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Таймаут сессии"""
+    await update.message.reply_text(
+        "⏱ Время сессии истекло (5 минут)\n\n"
+        "Начните заново с /create"
+    )
+    
+    context.user_data.pop('create_session', None)
+    return ConversationHandler.END
+
+# ============================================
+# ОБРАБОТКА ФОТО (ПРОСТОЙ РЕЖИМ)
+# ============================================
+
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработка фотографии от пользователя"""
     start_time = time.time()
@@ -901,13 +1425,44 @@ def main():
     
     application = Application.builder().token(BOT_TOKEN).build()
     
+    # ConversationHandler для интерактивного мастера
+    create_conversation = ConversationHandler(
+        entry_points=[CommandHandler('create', create_command)],
+        states={
+            WAITING_PHOTO: [
+                MessageHandler(filters.PHOTO, photo_received_wizard),
+            ],
+            CHOOSING_DURATION: [
+                CallbackQueryHandler(duration_selected, pattern='^duration_'),
+                CallbackQueryHandler(back_to_photo, pattern='^back_photo'),
+            ],
+            CHOOSING_QUALITY: [
+                CallbackQueryHandler(quality_selected, pattern='^quality_'),
+                CallbackQueryHandler(back_to_duration, pattern='^back_duration'),
+                CallbackQueryHandler(back_to_confirmation, pattern='^back_quality'),
+            ],
+            CONFIRMATION: [
+                CallbackQueryHandler(confirm_create_wizard, pattern='^confirm_create'),
+                CallbackQueryHandler(edit_duration_from_confirm, pattern='^edit_duration'),
+                CallbackQueryHandler(edit_quality_from_confirm, pattern='^edit_quality'),
+            ],
+        },
+        fallbacks=[
+            CallbackQueryHandler(cancel_wizard, pattern='^cancel'),
+            CommandHandler('cancel', cancel_command)
+        ],
+        conversation_timeout=300,  # 5 минут
+        name='create_video_wizard'
+    )
+    
     # Регистрируем обработчики
+    application.add_handler(create_conversation)  # Мастер в приоритете
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("balance", balance_command))
     application.add_handler(CommandHandler("stats", stats_command))
     application.add_handler(CommandHandler("addtokens", addtokens_command))
     application.add_handler(CommandHandler("users", users_command))
-    application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+    application.add_handler(MessageHandler(filters.PHOTO, handle_photo))  # Быстрый режим
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     
     logger.info("🚀 Бот запущен!")
