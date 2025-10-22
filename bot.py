@@ -9,7 +9,7 @@ from io import BytesIO
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, CallbackQueryHandler,
-    ConversationHandler, filters, ContextTypes
+    filters, ContextTypes
 )
 from telegram.error import BadRequest, RetryAfter
 from dotenv import load_dotenv
@@ -95,7 +95,8 @@ QUALITIES = {
 class ProcessingStats:
     def __init__(self, stats_file='processing_stats.json'):
         self.stats_file = stats_file
-        self.times = []
+        self.times = []  # Старый формат для совместимости
+        self.times_by_settings = {}  # Новый формат: {"duration_quality": [times]}
         self.load()
     
     def load(self):
@@ -112,24 +113,41 @@ class ProcessingStats:
                         logger.info(f"📊 Загружено {len(self.times)} записей (старый формат)")
                     else:
                         self.times = data.get('times', [])
-                        logger.info(f"📊 Загружено {len(self.times)} записей статистики")
+                        self.times_by_settings = data.get('times_by_settings', {})
+                        logger.info(f"📊 Загружено {len(self.times)} записей + {len(self.times_by_settings)} настроек")
         except Exception as e:
             logger.error(f"Ошибка загрузки статистики: {e}")
             self.times = []
+            self.times_by_settings = {}
     
     def save(self):
         """Сохранить статистику в файл"""
         try:
             import json
             with open(self.stats_file, 'w') as f:
-                json.dump({'times': self.times}, f)
+                json.dump({
+                    'times': self.times,
+                    'times_by_settings': self.times_by_settings
+                }, f)
         except Exception as e:
             logger.error(f"Ошибка сохранения статистики: {e}")
     
-    def add_time(self, duration):
+    def add_time(self, duration, video_duration=None, quality=None):
         """Добавить время обработки"""
         self.times.append(duration)
-        # Храним последние 100 записей
+        
+        # Если есть настройки - сохраняем по ключу
+        if video_duration is not None and quality is not None:
+            key = f"{video_duration}_{quality}"
+            if key not in self.times_by_settings:
+                self.times_by_settings[key] = []
+            self.times_by_settings[key].append(duration)
+            
+            # Храним только последние 20 записей для каждой настройки
+            if len(self.times_by_settings[key]) > 20:
+                self.times_by_settings[key] = self.times_by_settings[key][-20:]
+        
+        # Храним только последние 100 записей в общем списке
         if len(self.times) > 100:
             self.times = self.times[-100:]
         self.save()
@@ -145,6 +163,14 @@ class ProcessingStats:
             return 120
         recent = self.times[-10:]
         return sum(recent) / len(recent)
+    
+    def get_average_by_settings(self, video_duration, quality):
+        """Получить среднее время для конкретных настроек"""
+        key = f"{video_duration}_{quality}"
+        if key in self.times_by_settings and self.times_by_settings[key]:
+            times = self.times_by_settings[key]
+            return sum(times) / len(times)
+        return None
 
 processing_stats = ProcessingStats()
 
@@ -277,8 +303,7 @@ class TokenBalance:
 
 token_balance = TokenBalance()
 
-# States для ConversationHandler
-WAITING_PHOTO, CHOOSING_DURATION, CHOOSING_QUALITY, CONFIRMATION = range(4)
+# Константы для мастера создания видео
 
 def calculate_cost(duration, quality):
     """Рассчитать итоговую стоимость"""
@@ -302,6 +327,25 @@ def format_time(seconds):
         hours = int(seconds // 3600)
         minutes = int((seconds % 3600) // 60)
         return f"{hours}ч {minutes}м"
+
+def get_estimated_time(duration, quality):
+    """Рассчитать примерное время создания видео"""
+    # Сначала пробуем найти точное время для этих настроек
+    exact_time = processing_stats.get_average_by_settings(duration, quality)
+    if exact_time:
+        logger.info(f"🎯 Используем точное время для {duration}с/{quality}: {format_time(exact_time)}")
+        return format_time(exact_time)
+    
+    # Если нет точного времени - используем общее среднее (это основной fallback)
+    general_average = processing_stats.get_average()
+    if general_average > 0:
+        logger.info(f"📊 Используем общее среднее время: {format_time(general_average)}")
+        return format_time(general_average)
+    
+    # Если вообще нет истории - используем разумное время по умолчанию
+    default_time = 120  # 2 минуты по умолчанию
+    logger.info(f"🔮 Используем время по умолчанию: {format_time(default_time)}")
+    return format_time(default_time)
 
 def get_average_time():
     """Получить среднее время обработки (последние 10 запросов)"""
@@ -335,34 +379,240 @@ async def safe_edit_message(message, text, max_retries=3):
                 await asyncio.sleep(1)
     return False
 
+def create_main_menu():
+    """Создать главное меню"""
+    keyboard = [
+        [
+            InlineKeyboardButton("🎬 Создать видео", callback_data='create_video'),
+            InlineKeyboardButton("⚡ Быстрый режим", callback_data='quick_mode')
+        ],
+        [
+            InlineKeyboardButton("💰 Баланс", callback_data='balance'),
+            InlineKeyboardButton("📊 Статистика", callback_data='stats')
+        ],
+        [
+            InlineKeyboardButton("❓ Помощь", callback_data='help')
+        ]
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Команда /start"""
     user_id = update.effective_user.id
     user = update.effective_user
-    username = user.username
-    first_name = user.first_name
+    first_name = user.first_name or user.username or "Пользователь"
     last_name = user.last_name
+    username = user.username
     
     # Обновляем информацию о пользователе
     balance = token_balance.get_balance(user_id)
     token_balance.add_tokens(user_id, 0, username, first_name, last_name)
     
-    avg_time = get_average_time()
-    times = processing_stats.get_times()
-    stats_text = ""
-    if times:
-        stats_text = f"\n📊 Среднее время: {format_time(avg_time)}"
+    # Проверяем новый ли пользователь
+    is_new_user = balance == DEFAULT_TOKENS
+    
+    if is_new_user:
+        # Онбординг для новых пользователей
+        text = f"""🎉 Добро пожаловать, {first_name}!
+
+Я создаю анимированные видео из ваших фотографий с помощью ИИ.
+
+🎁 **Бонус новичка**: {DEFAULT_TOKENS} токенов в подарок!
+
+🎬 **Как это работает:**
+• Отправьте фото → получите видео
+• Выберите длительность и качество
+• Стоимость: от 5 токенов
+
+Готовы попробовать?"""
+    else:
+        # Обычное приветствие
+        avg_time = get_average_time()
+        times = processing_stats.get_times()
+        stats_text = ""
+        if times:
+            stats_text = f"\n📊 Среднее время: {format_time(avg_time)}"
+        
+        text = f"""👋 Привет, {first_name}!
+
+Я создаю анимированные видео из фотографий!{stats_text}
+
+💰 **Ваш баланс**: {balance} токенов
+💵 **Стоимость**: от 5 токенов
+
+Выберите действие:"""
     
     await update.message.reply_text(
-        f'👋 Привет, {username}!\n\n'
-        f'Я создаю видео из фотографий!{stats_text}\n\n'
-        f'🎬 Два способа создания:\n'
-        f'• /create - мастер с выбором параметров\n'
-        f'• Просто отправьте фото - быстрый режим\n\n'
-        f'💰 Баланс: {balance} токенов\n'
-        f'💵 Стоимость: от 5 токенов\n\n'
-        f'📋 /balance - баланс | /stats - статистика'
+        text,
+        reply_markup=create_main_menu()
     )
+
+async def handle_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик кнопок главного меню"""
+    query = update.callback_query
+    await query.answer()
+    
+    user_id = query.from_user.id
+    data = query.data
+    
+    if data == 'create_video':
+        # Запускаем мастер создания видео
+        await query.edit_message_text(
+            "🎬 **Мастер создания видео**\n\n"
+            "Отправьте фото для создания видео с выбором параметров:",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("🔙 Назад", callback_data='back_to_menu')
+            ]])
+        )
+        # Создаем сессию мастера и устанавливаем состояние ожидания фото
+        context.user_data['create_session'] = {
+            'user_id': user_id,
+            'username': query.from_user.username or query.from_user.first_name
+        }
+        context.user_data['waiting_for_photo'] = 'wizard'
+        
+    elif data == 'quick_mode':
+        # Быстрый режим
+        await query.edit_message_text(
+            "⚡ **Быстрый режим**\n\n"
+            "Отправьте фото для быстрого создания видео (10 сек, среднее качество):",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("🔙 Назад", callback_data='back_to_menu')
+            ]])
+        )
+        # Устанавливаем состояние ожидания фото для быстрого режима
+        context.user_data['waiting_for_photo'] = 'quick'
+        
+    elif data == 'balance':
+        # Показываем баланс
+        balance = token_balance.get_balance(user_id)
+        username = query.from_user.username or query.from_user.first_name or "Пользователь"
+        
+        await query.edit_message_text(
+            f"💰 **Ваш баланс**\n\n"
+            f"👤 {username}\n"
+            f"🪙 Токенов: {balance}\n"
+            f"🎬 Доступно видео: {balance // 5}\n\n"
+            f"💡 Один токен = 1 секунда видео",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("🔙 Назад", callback_data='back_to_menu')
+            ]])
+        )
+        
+    elif data == 'stats':
+        # Показываем статистику
+        times = processing_stats.get_times()
+        if times:
+            avg_time = get_average_time()
+            fastest = min(times)
+            slowest = max(times)
+            recent_times = times[-10:] if len(times) >= 10 else times
+            recent_str = ", ".join([format_time(t) for t in recent_times])
+            
+            text = f"""📊 **Статистика обработки** ({len(times)} видео)
+
+⚡ **Быстрее всего**: {format_time(fastest)}
+📈 **В среднем**: {format_time(avg_time)}
+🐌 **Дольше всего**: {format_time(slowest)}
+
+🔄 **Последние 10**: {recent_str}"""
+        else:
+            text = "📊 **Статистика обработки**\n\nПока нет данных"
+        
+        await query.edit_message_text(
+            text,
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("🔙 Назад", callback_data='back_to_menu')
+            ]])
+        )
+        
+    elif data == 'help':
+        # Показываем помощь
+        await query.edit_message_text(
+            "❓ **Помощь**\n\n"
+            "🎬 **Создание видео:**\n"
+            "• Мастер: выбор длительности и качества\n"
+            "• Быстрый: 10 сек, среднее качество\n\n"
+            "💰 **Токены:**\n"
+            "• 5 токенов = 5 секунд видео\n"
+            "• 10 токенов = 10 секунд видео\n"
+            "• 15 токенов = 15 секунд видео\n\n"
+            "📱 **Навигация:**\n"
+            "• Все действия через кнопки\n"
+            "• /start - главное меню\n"
+            "• Кнопка 'Назад' везде\n\n"
+            "💡 **Совет:** Просто отправьте фото для быстрого создания!",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("🔙 Назад", callback_data='back_to_menu')
+            ]])
+        )
+        
+    elif data == 'create_more':
+        # Создать еще через мастер
+        await query.answer("🎬 Запускаю мастер создания видео")
+        await query.message.reply_text(
+            "🎬 **Мастер создания видео**\n\n"
+            "Отправьте фото для создания видео с выбором параметров:",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("🔙 Назад", callback_data='back_to_menu')
+            ]])
+        )
+        # Создаем сессию мастера и устанавливаем состояние ожидания фото
+        context.user_data['create_session'] = {
+            'user_id': user_id,
+            'username': query.from_user.username or query.from_user.first_name
+        }
+        context.user_data['waiting_for_photo'] = 'wizard'
+        
+    elif data == 'quick_more':
+        # Быстрый режим
+        await query.answer("⚡ Запускаю быстрый режим")
+        await query.message.reply_text(
+            "⚡ **Быстрый режим**\n\n"
+            "Отправьте фото для быстрого создания видео (10 сек, среднее качество):",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("🔙 Назад", callback_data='back_to_menu')
+            ]])
+        )
+        # Устанавливаем состояние ожидания фото для быстрого режима
+        context.user_data['waiting_for_photo'] = 'quick'
+        
+    elif data == 'back_to_menu':
+        # Возвращаемся в главное меню
+        await query.answer("🏠 Возвращаюсь в главное меню")
+        user = query.from_user
+        first_name = user.first_name or user.username or "Пользователь"
+        balance = token_balance.get_balance(user_id)
+        
+        text = f"""👋 Привет, {first_name}!
+
+Я создаю анимированные видео из фотографий!
+
+💰 **Ваш баланс**: {balance} токенов
+💵 **Стоимость**: от 5 токенов
+
+Выберите действие:"""
+        
+        await query.message.reply_text(
+            text,
+            reply_markup=create_main_menu()
+        )
+        # Сбрасываем состояние ожидания фото и сессию мастера
+        context.user_data.pop('waiting_for_photo', None)
+        context.user_data.pop('create_session', None)
+
+def create_generate_more_menu():
+    """Создать меню 'Создать еще'"""
+    keyboard = [
+        [
+            InlineKeyboardButton("🎬 Создать еще", callback_data='create_more'),
+            InlineKeyboardButton("⚡ Быстрый режим", callback_data='quick_more')
+        ],
+        [
+            InlineKeyboardButton("🏠 Главное меню", callback_data='back_to_menu')
+        ]
+    ]
+    return InlineKeyboardMarkup(keyboard)
 
 async def balance_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Команда /balance"""
@@ -544,16 +794,21 @@ async def process_comfyui_connect(session, photo_base64, client_id, status_messa
         "client_id": client_id
     }
     
-    # Логируем параметры (пока не отправляем на сервер)
-    # TODO: Настроить workflow в ComfyUI для приёма параметров через $duration и $quality ноды
-    if duration is not None:
-        logger.info(f"📏 Параметр: Длительность {duration} секунд")
-        # payload["duration"] = {"seconds": duration}  # Будет позже
+    # Добавляем параметры (обязательные по OpenAPI)
+    # Если не указаны - используем стандартные значения
+    if duration is None:
+        duration = 10  # Стандарт
     
-    if quality is not None:
-        quality_pixels = QUALITIES[quality]['pixels']
-        logger.info(f"📺 Параметр: Качество {quality_pixels}px")
-        # payload["quality"] = {"pixels": quality_pixels}  # Будет позже
+    if quality is None:
+        quality = 'medium'  # Стандарт
+    
+    quality_pixels = QUALITIES[quality]['pixels']
+    
+    payload["duration"] = {"value": duration}
+    payload["quality"] = {"value": quality_pixels}
+    
+    logger.info(f"📏 Длительность: {duration} секунд")
+    logger.info(f"📺 Качество: {quality_pixels}px")
     
     logger.info(f"🚀 Отправляю запрос на ComfyUI-Connect: {API_URL}")
     logger.debug(f"Payload keys: {payload.keys()}")
@@ -850,7 +1105,7 @@ async def create_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "💵 Минимум для создания: 5 токенов\n\n"
             "Обратитесь к администратору"
         )
-        return ConversationHandler.END
+        return
     
     context.user_data['create_session'] = {
         'started_at': time.time(),
@@ -874,13 +1129,16 @@ async def create_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
     
-    return WAITING_PHOTO
+    # Состояние сохраняется в user_data
 
 async def photo_received_wizard(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Получено фото в мастере"""
     if 'create_session' not in context.user_data:
-        await update.message.reply_text("Сначала запустите /create")
-        return ConversationHandler.END
+        # Если пользователь пришел через меню, создаем сессию
+        context.user_data['create_session'] = {
+            'user_id': update.effective_user.id,
+            'username': update.effective_user.username or update.effective_user.first_name
+        }
     
     photo = update.message.photo[-1]
     file = await context.bot.get_file(photo.file_id)
@@ -921,12 +1179,16 @@ async def photo_received_wizard(update: Update, context: ContextTypes.DEFAULT_TY
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
     
-    return CHOOSING_DURATION
+    # Состояние сохраняется в user_data
 
 async def duration_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Выбрана длительность"""
     query = update.callback_query
     await query.answer()
+    
+    if 'create_session' not in context.user_data:
+        await query.edit_message_text("❌ Сессия не найдена. Начните заново с /start")
+        return
     
     duration = query.data.split('_')[1]
     session = context.user_data['create_session']
@@ -966,12 +1228,16 @@ async def duration_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
     
-    return CHOOSING_QUALITY
+    # Состояние сохраняется в user_data
 
 async def quality_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Выбрано качество - показываем подтверждение"""
     query = update.callback_query
     await query.answer()
+    
+    if 'create_session' not in context.user_data:
+        await query.edit_message_text("❌ Сессия не найдена. Начните заново с /start")
+        return
     
     quality = query.data.split('_')[1]
     session = context.user_data['create_session']
@@ -992,32 +1258,26 @@ async def quality_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"💵 Требуется: {cost}\n\n"
             f"Выберите другие параметры или обратитесь к администратору"
         )
-        return ConversationHandler.END
+        return
     
     duration_info = DURATIONS[str(duration)]
     quality_info = QUALITIES[quality]
     
     text = f"""📋 Подтверждение создания
 
-╔════════════════════════════╗
-║  ПАРАМЕТРЫ ВИДЕО           ║
-╠════════════════════════════╣
-║ 📸 Фото: {session['photo_width']}×{session['photo_height']} px    ║
-║ ⏱ Длительность: {duration} секунд   ║
-║ 📺 Качество: {quality_info['pixels']}px         ║
-╠════════════════════════════╣
-║ 💰 СТОИМОСТЬ               ║
-╠════════════════════════════╣
-║ Базовая: {duration_info['cost']} токенов         ║
-║ Качество: +{quality_info['cost_modifier']} токенов        ║
-║ ─────────────────────      ║
-║ Итого: {cost} токенов           ║
-╠════════════════════════════╣
-║ 💳 Баланс: {balance}             ║
-║ 💵 Останется: {balance - cost}        ║
-╚════════════════════════════╝
+📸 **Фото:** {session['photo_width']}×{session['photo_height']} px
+⏱ **Длительность:** {duration} секунд
+📺 **Качество:** {quality_info['pixels']}px
 
-⏱ Примерное время: ~2 минуты
+💰 **Стоимость:**
+• Базовая: {duration_info['cost']} токенов
+• Качество: +{quality_info['cost_modifier']} токенов
+• **Итого:** {cost} токенов
+
+💳 **Баланс:** {balance}
+💵 **Останется:** {balance - cost}
+
+⏱ **Примерное время:** ~{get_estimated_time(duration, quality)}
 
 Всё правильно?
 """
@@ -1037,7 +1297,7 @@ async def quality_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
     
-    return CONFIRMATION
+    # Состояние сохраняется в user_data
 
 async def confirm_create_wizard(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Подтверждено - начинаем обработку"""
@@ -1097,7 +1357,7 @@ async def confirm_create_wizard(update: Update, context: ContextTypes.DEFAULT_TY
                     )
                 else:
                     total_time = time.time() - start_time
-                    processing_stats.add_time(total_time)
+                    processing_stats.add_time(total_time, session['duration'], session['quality'])
                     
                     token_balance.spend_tokens(user_id, calculate_cost(session['duration'], session['quality']))
                     token_balance.increment_videos(user_id)
@@ -1118,8 +1378,10 @@ async def confirm_create_wizard(update: Update, context: ContextTypes.DEFAULT_TY
                             f"🎬 Видео готово!\n"
                             f"⏱ {format_time(total_time)}\n\n"
                             f"💸 Списано: {calculate_cost(session['duration'], session['quality'])} токенов\n"
-                            f"💰 Остаток: {new_balance}"
-                        )
+                            f"💰 Остаток: {new_balance}\n\n"
+                            f"🤖 Создано ботом: @{update.get_bot().username}"
+                        ),
+                        reply_markup=create_generate_more_menu()
                     )
                     
                     await status_message.delete()
@@ -1138,7 +1400,7 @@ async def confirm_create_wizard(update: Update, context: ContextTypes.DEFAULT_TY
     finally:
         context.user_data.pop('create_session', None)
     
-    return ConversationHandler.END
+    return
 
 async def back_to_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Возврат к загрузке фото"""
@@ -1156,7 +1418,7 @@ async def back_to_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
     
-    return WAITING_PHOTO
+    # Состояние сохраняется в user_data
 
 async def back_to_duration(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Возврат к выбору длительности"""
@@ -1188,7 +1450,7 @@ async def back_to_duration(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
     
-    return CHOOSING_DURATION
+    # Состояние сохраняется в user_data
 
 async def edit_duration_from_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Редактирование длительности с экрана подтверждения"""
@@ -1233,7 +1495,7 @@ async def edit_quality_from_confirm(update: Update, context: ContextTypes.DEFAUL
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
     
-    return CHOOSING_QUALITY
+    # Состояние сохраняется в user_data
 
 async def back_to_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Возврат к подтверждению (после редактирования)"""
@@ -1248,10 +1510,11 @@ async def cancel_wizard(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     await query.edit_message_text(
         "❌ Создание видео отменено.\n\n"
-        "Для нового запроса используйте /create"
+        "Для нового запроса используйте /start или отправьте фото",
+        reply_markup=create_main_menu()
     )
     
-    return ConversationHandler.END
+    return
 
 async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Команда /cancel"""
@@ -1259,20 +1522,22 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     await update.message.reply_text(
         "❌ Текущая операция отменена.\n\n"
-        "Для создания видео используйте /create"
+        "Для создания видео используйте /start или отправьте фото",
+        reply_markup=create_main_menu()
     )
     
-    return ConversationHandler.END
+    return
 
 async def conversation_timeout(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Таймаут сессии"""
     await update.message.reply_text(
         "⏱ Время сессии истекло (5 минут)\n\n"
-        "Начните заново с /create"
+        "Начните заново с /start или отправьте фото",
+        reply_markup=create_main_menu()
     )
     
     context.user_data.pop('create_session', None)
-    return ConversationHandler.END
+    return
 
 # ============================================
 # ОБРАБОТКА ФОТО (ПРОСТОЙ РЕЖИМ)
@@ -1288,12 +1553,27 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     balance = token_balance.get_balance(user_id)
     token_balance.add_tokens(user_id, 0, user.username, user.first_name, user.last_name)
     
-    if balance < TOKENS_PER_VIDEO:
+    # Проверяем режим работы
+    waiting_mode = context.user_data.get('waiting_for_photo')
+    
+    if waiting_mode == 'wizard':
+        # Запускаем мастер создания видео
+        context.user_data.pop('waiting_for_photo', None)
+        # Передаем управление мастеру
+        await photo_received_wizard(update, context)
+        return
+    elif waiting_mode == 'quick':
+        # Быстрый режим - продолжаем обычную обработку
+        context.user_data.pop('waiting_for_photo', None)
+    
+    # Проверяем баланс для быстрого режима
+    default_cost = calculate_cost(10, 'medium')
+    if balance < default_cost:
         await update.message.reply_text(
             f'❌ Недостаточно токенов!\n\n'
             f'💰 Баланс: {balance}\n'
-            f'💵 Требуется: {TOKENS_PER_VIDEO}\n\n'
-            f'Обратитесь к @{(await update.get_bot()).username} администратору'
+            f'💵 Требуется: {default_cost}\n\n'
+            f'Обратитесь к администратору'
         )
         return
     
@@ -1335,8 +1615,11 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 progress_task = asyncio.create_task(progress_updater())
                 
                 # Отправляем запрос в ComfyUI-Connect (это может занять несколько минут)
+                # Используем значения по умолчанию для обычной отправки фото
                 video_data, error = await process_comfyui_connect(
-                    session, photo_base64, client_id, status_message, start_time
+                    session, photo_base64, client_id, status_message, start_time,
+                    duration=10,  # По умолчанию 10 секунд
+                    quality='medium'  # По умолчанию среднее качество
                 )
                 
                 # Останавливаем обновление прогресса
@@ -1360,7 +1643,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 
                 # Успех! Отправляем видео
                 total_time = time.time() - start_time
-                processing_stats.add_time(total_time)
+                processing_stats.add_time(total_time, 10, 'medium')  # Настройки по умолчанию
                 
                 await safe_edit_message(
                     status_message,
@@ -1368,8 +1651,9 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     f"📤 Отправляю видео..."
                 )
                 
-                # Списываем токены и увеличиваем счетчик видео
-                token_balance.spend_tokens(user_id, TOKENS_PER_VIDEO)
+                # Списываем токены и увеличиваем счетчик видео (настройки по умолчанию)
+                default_cost = calculate_cost(10, 'medium')
+                token_balance.spend_tokens(user_id, default_cost)
                 token_balance.increment_videos(user_id)
                 new_balance = token_balance.get_balance(user_id)
                 
@@ -1382,9 +1666,11 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     caption=(
                         f"🎬 Видео готово!\n"
                         f"⏱ {format_time(total_time)}\n\n"
-                        f"💸 Списано: {TOKENS_PER_VIDEO} токенов\n"
-                        f"💰 Остаток: {new_balance}"
-                    )
+                        f"💸 Списано: {default_cost} токенов\n"
+                        f"💰 Остаток: {new_balance}\n\n"
+                        f"🤖 Создано ботом: @{update.get_bot().username}"
+                    ),
+                    reply_markup=create_generate_more_menu()
                 )
                 
                 # Удаляем статус-сообщение
@@ -1423,43 +1709,27 @@ def main():
     
     application = Application.builder().token(BOT_TOKEN).build()
     
-    # ConversationHandler для интерактивного мастера
-    create_conversation = ConversationHandler(
-        entry_points=[CommandHandler('create', create_command)],
-        states={
-            WAITING_PHOTO: [
-                MessageHandler(filters.PHOTO, photo_received_wizard),
-            ],
-            CHOOSING_DURATION: [
-                CallbackQueryHandler(duration_selected, pattern='^duration_'),
-                CallbackQueryHandler(back_to_photo, pattern='^back_photo'),
-            ],
-            CHOOSING_QUALITY: [
-                CallbackQueryHandler(quality_selected, pattern='^quality_'),
-                CallbackQueryHandler(back_to_duration, pattern='^back_duration'),
-                CallbackQueryHandler(back_to_confirmation, pattern='^back_quality'),
-            ],
-            CONFIRMATION: [
-                CallbackQueryHandler(confirm_create_wizard, pattern='^confirm_create'),
-                CallbackQueryHandler(edit_duration_from_confirm, pattern='^edit_duration'),
-                CallbackQueryHandler(edit_quality_from_confirm, pattern='^edit_quality'),
-            ],
-        },
-        fallbacks=[
-            CallbackQueryHandler(cancel_wizard, pattern='^cancel'),
-            CommandHandler('cancel', cancel_command)
-        ],
-        conversation_timeout=300,  # 5 минут
-        name='create_video_wizard'
-    )
+    # Обработчики для мастера создания видео (без ConversationHandler)
     
     # Регистрируем обработчики
-    application.add_handler(create_conversation)  # Мастер в приоритете
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("balance", balance_command))
-    application.add_handler(CommandHandler("stats", stats_command))
-    application.add_handler(CommandHandler("addtokens", addtokens_command))
-    application.add_handler(CommandHandler("users", users_command))
+    application.add_handler(CommandHandler("start", start))  # Главная команда
+    application.add_handler(CommandHandler("addtokens", addtokens_command))  # Админская
+    application.add_handler(CommandHandler("users", users_command))  # Админская
+    
+    # Обработчик кнопок главного меню
+    application.add_handler(CallbackQueryHandler(handle_menu_callback, pattern='^(create_video|quick_mode|balance|stats|help|back_to_menu|create_more|quick_more)$'))
+    
+    # Обработчики для мастера создания видео
+    application.add_handler(CallbackQueryHandler(duration_selected, pattern='^duration_'))
+    application.add_handler(CallbackQueryHandler(quality_selected, pattern='^quality_'))
+    application.add_handler(CallbackQueryHandler(confirm_create_wizard, pattern='^confirm_create'))
+    application.add_handler(CallbackQueryHandler(edit_duration_from_confirm, pattern='^edit_duration'))
+    application.add_handler(CallbackQueryHandler(edit_quality_from_confirm, pattern='^edit_quality'))
+    application.add_handler(CallbackQueryHandler(back_to_photo, pattern='^back_photo'))
+    application.add_handler(CallbackQueryHandler(back_to_duration, pattern='^back_duration'))
+    application.add_handler(CallbackQueryHandler(back_to_confirmation, pattern='^back_quality'))
+    application.add_handler(CallbackQueryHandler(cancel_wizard, pattern='^cancel'))
+    
     application.add_handler(MessageHandler(filters.PHOTO, handle_photo))  # Быстрый режим
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     
